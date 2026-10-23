@@ -2,18 +2,23 @@ package mega
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	mrand "math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // Upload contains the internal state of a upload
@@ -68,10 +73,9 @@ func (m *Mega) NewUpload(parent *Node, name string, fileSize int64) (*Upload, er
 		return nil, err
 	}
 
-	ukey := []uint32{0, 0, 0, 0, 0, 0}
-	for i := range ukey {
-		ukey[i] = uint32(mrand.Int31())
-
+	ukey := make([]uint32, 6)
+	if err := binary.Read(rand.Reader, binary.BigEndian, ukey); err != nil {
+		return nil, err
 	}
 
 	kbytes, err := a32_to_bytes(ukey[:4])
@@ -94,11 +98,14 @@ func (m *Mega) NewUpload(parent *Node, name string, fileSize int64) (*Upload, er
 	}
 
 	chunks := getChunkSizes(fileSize)
+	chunk_macs := make([][]byte, len(chunks))
 
 	// File size is zero
-	// Do one empty request to get the completion handle
+	// Do one empty request to get the completion handle. The MAC of
+	// the empty chunk is all zeros.
 	if len(chunks) == 0 {
 		chunks = append(chunks, chunkSize{position: 0, size: 0})
+		chunk_macs = append(chunk_macs, make([]byte, 16))
 	}
 
 	uploadUrl := res[0].P
@@ -118,7 +125,7 @@ func (m *Mega) NewUpload(parent *Node, name string, fileSize int64) (*Upload, er
 		kbytes:            kbytes,
 		ukey:              ukey,
 		chunks:            chunks,
-		chunk_macs:        make([][]byte, len(chunks)),
+		chunk_macs:        chunk_macs,
 		completion_handle: []byte{},
 	}
 	return u, nil
@@ -138,92 +145,101 @@ func (u *Upload) ChunkLocation(id int) (position int64, size int, err error) {
 }
 
 // UploadChunk uploads the chunk of id
-func (u *Upload) UploadChunk(id int, chunk []byte) (err error) {
-	chk_start, chk_size, err := u.ChunkLocation(id)
+func (u *Upload) UploadChunk(id int, chunk []byte) error {
+	_, chk_size, err := u.ChunkLocation(id)
 	if err != nil {
 		return err
 	}
 	if len(chunk) != chk_size {
 		return errors.New("upload chunk is wrong size")
 	}
-	ctr_iv, err := bytes_to_a32(u.kiv)
-	if err != nil {
-		return err
-	}
-	ctr_iv[2] = uint32(uint64(chk_start) / 0x1000000000)
-	ctr_iv[3] = uint32(chk_start / 0x10)
-	bctr_iv, err := a32_to_bytes(ctr_iv)
-	if err != nil {
-		return err
-	}
-	ctr_aes := cipher.NewCTR(u.aes_block, bctr_iv)
+	return u.UploadFrom(context.Background(), id, 1, bytes.NewReader(chunk))
+}
 
-	enc := cipher.NewCBCEncrypter(u.aes_block, u.iv)
+// setChunkMAC records the MAC of chunk id
+func (u *Upload) setChunkMAC(id int, mac []byte) {
+	u.mutex.Lock()
+	u.chunk_macs[id] = mac
+	u.mutex.Unlock()
+}
 
-	i := 0
-	block := make([]byte, 16)
-	paddedchunk := paddnull(chunk, 16)
-	for i = 0; i < len(paddedchunk); i += 16 {
-		copy(block[0:16], paddedchunk[i:i+16])
-		enc.CryptBlocks(block, block)
-	}
-
-	var rsp *http.Response
-	var req *http.Request
-	ctr_aes.XORKeyStream(chunk, chunk)
-	chk_url := fmt.Sprintf("%s/%d", u.uploadUrl, chk_start)
-
-	sleepTime := minSleepTime // initial backoff time
-	for retry := 0; retry < u.m.retries+1; retry++ {
-		reader := bytes.NewBuffer(chunk)
-		req, err = http.NewRequest("POST", chk_url, reader)
+// postRange uploads the encrypted data at offset, retrying as
+// configured, and records the completion handle if the server returns
+// one.
+func (u *Upload) postRange(ctx context.Context, offset int64, data []byte) error {
+	url := fmt.Sprintf("%s/%d", u.uploadUrl, offset)
+	what := fmt.Sprintf("%s: upload %d+%d", u.name, offset, len(data))
+	return u.m.withRetries(ctx, what, func() error {
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
 		if err != nil {
 			return err
 		}
-		rsp, err = u.m.client.Do(req)
-		if err == nil {
-			if rsp.StatusCode == 200 {
-				break
-			}
-			err = errors.New("Http Status: " + rsp.Status)
-			_ = rsp.Body.Close()
+		resp, err := u.m.client.Do(req)
+		if err != nil {
+			return err
 		}
-		u.m.debugf("%s: Retry upload chunk %d/%d: %v", u.name, retry, u.m.retries, err)
-		backOffSleep(&sleepTime)
-	}
-	if err != nil {
-		return err
-	}
-	if rsp == nil {
-		return errors.New("retries exceeded")
-	}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != 200 {
+			return statusError(resp)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return err
+		}
+		// errors are sent as a negative number
+		if code, err := strconv.Atoi(string(body)); err == nil && code < 0 {
+			return parseError(ErrorMsg(code))
+		}
+		if len(body) > 0 {
+			u.mutex.Lock()
+			u.completion_handle = body
+			u.mutex.Unlock()
+		}
+		return nil
+	})
+}
 
-	chunk_resp, err := io.ReadAll(rsp.Body)
-	if err != nil {
-		_ = rsp.Body.Close()
-		return err
+// UploadFrom uploads n chunks starting at chunk id, or the chunks from
+// id to the end of the file if n < 0, reading their contents from in.
+//
+// The data is sent in HTTP requests of at least the configured upload
+// request size (see SetUploadRequestSize) ending on chunk boundaries,
+// using up to the configured number of upload workers concurrently.
+// Failed requests are retried. Up to (workers + 1) requests' worth of
+// data is buffered.
+//
+// Finish may be called once every chunk has been uploaded.
+func (u *Upload) UploadFrom(ctx context.Context, id, n int, in io.Reader) error {
+	if id < 0 || id >= len(u.chunks) {
+		return EARGS
 	}
-
-	err = rsp.Body.Close()
-	if err != nil {
-		return err
+	offset := u.chunks[id].position
+	chunks := u.chunks[id:]
+	if n >= 0 && n < len(chunks) {
+		chunks = chunks[:n]
 	}
-
-	if !bytes.Equal(chunk_resp, nil) {
-		u.mutex.Lock()
-		u.completion_handle = chunk_resp
-		u.mutex.Unlock()
+	mac := newMACWriter(u.aes_block, u.iv, u.chunks, offset, u.setChunkMAC)
+	// MAC the plaintext, then encrypt it
+	in = cipher.StreamReader{S: newCTR(u.aes_block, u.kiv, offset), R: io.TeeReader(in, mac)}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(max(u.m.ul_workers, 1))
+	for _, part := range groupChunks(chunks, u.m.ul_reqsize) {
+		if gctx.Err() != nil {
+			break
+		}
+		data := make([]byte, part.size)
+		if _, err := io.ReadFull(in, data); err != nil {
+			cancel()
+			_ = g.Wait()
+			return err
+		}
+		g.Go(func() error {
+			return u.postRange(gctx, part.position, data)
+		})
 	}
-
-	// Update chunk MACs on success only
-	u.mutex.Lock()
-	if len(u.chunk_macs) > 0 {
-		u.chunk_macs[id] = make([]byte, 16)
-		copy(u.chunk_macs[id], block)
-	}
-	u.mutex.Unlock()
-
-	return nil
+	return g.Wait()
 }
 
 // Finish completes the upload and returns the created node
@@ -328,61 +344,7 @@ func (m *Mega) UploadFile(srcpath string, parent *Node, name string, progress *c
 		return nil, err
 	}
 
-	workch := make(chan int)
-	errch := make(chan error, m.ul_workers)
-	wg := sync.WaitGroup{}
-
-	// Fire chunk upload workers
-	for w := 0; w < m.ul_workers; w++ {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			for id := range workch {
-				chk_start, chk_size, err := u.ChunkLocation(id)
-				if err != nil {
-					errch <- err
-					return
-				}
-				chunk := make([]byte, chk_size)
-				n, err := infile.ReadAt(chunk, chk_start)
-				if err != nil && err != io.EOF {
-					errch <- err
-					return
-				}
-				if n != len(chunk) {
-					errch <- errors.New("chunk too short")
-					return
-				}
-
-				err = u.UploadChunk(id, chunk)
-				if err != nil {
-					errch <- err
-					return
-				}
-
-				if progress != nil {
-					*progress <- chk_size
-				}
-			}
-		}()
-	}
-
-	// Place chunk download jobs to chan
-	err = nil
-	for id := 0; id < u.Chunks() && err == nil; {
-		select {
-		case workch <- id:
-			id++
-		case err = <-errch:
-		}
-	}
-
-	close(workch)
-
-	wg.Wait()
-
+	err = u.UploadFrom(context.Background(), 0, -1, withProgress(infile, progress))
 	if err != nil {
 		return nil, err
 	}

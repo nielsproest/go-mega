@@ -5,13 +5,13 @@ import (
 	"crypto/aes"
 	"crypto/rand"
 	"crypto/sha512"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
-	mrand "math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -28,8 +28,10 @@ const (
 	RETRIES                    = 10
 	DOWNLOAD_WORKERS           = 3
 	MAX_DOWNLOAD_WORKERS       = 30
+	DOWNLOAD_REQUEST_SIZE      = 8 * 1024 * 1024
 	UPLOAD_WORKERS             = 1
 	MAX_UPLOAD_WORKERS         = 30
+	UPLOAD_REQUEST_SIZE        = 8 * 1024 * 1024
 	TIMEOUT                    = time.Second * 10
 	HTTPSONLY                  = false
 	minSleepTime               = 10 * time.Millisecond // for retries
@@ -42,7 +44,9 @@ type config struct {
 	baseurl    string
 	retries    int
 	dl_workers int
+	dl_reqsize int64
 	ul_workers int
+	ul_reqsize int64
 	timeout    time.Duration
 	https      bool
 }
@@ -52,7 +56,9 @@ func newConfig() config {
 		baseurl:    getAPIBaseURL(),
 		retries:    RETRIES,
 		dl_workers: DOWNLOAD_WORKERS,
+		dl_reqsize: DOWNLOAD_REQUEST_SIZE,
 		ul_workers: UPLOAD_WORKERS,
+		ul_reqsize: UPLOAD_REQUEST_SIZE,
 		timeout:    TIMEOUT,
 		https:      HTTPSONLY,
 	}
@@ -71,7 +77,7 @@ func (c *config) SetRetries(r int) {
 	c.retries = r
 }
 
-// Set concurrent download workers
+// Set concurrent download workers used by DownloadFile and Download.NewReader
 func (c *config) SetDownloadWorkers(w int) error {
 	if w <= MAX_DOWNLOAD_WORKERS {
 		c.dl_workers = w
@@ -81,12 +87,33 @@ func (c *config) SetDownloadWorkers(w int) error {
 	return EWORKER_LIMIT_EXCEEDED
 }
 
+// maxRequestSize caps the request sizes so they fit in an int on 32
+// bit platforms
+const maxRequestSize = 1024 * 1024 * 1024
+
+// SetDownloadRequestSize sets the maximum size of each HTTP request made
+// by Download.NewReader, capped at 1 GiB. If it is <= 0 each request is
+// at most 1 MiB, the size of the largest chunk.
+func (c *config) SetDownloadRequestSize(size int64) {
+	if size <= 0 {
+		size = firstRequestSize
+	}
+	c.dl_reqsize = min(size, maxRequestSize)
+}
+
+// SetUploadRequestSize sets the minimum size of each HTTP request made
+// by Upload.UploadFrom, capped at 1 GiB. Requests always end on a chunk
+// boundary, so if it is <= 0 each request uploads a single chunk.
+func (c *config) SetUploadRequestSize(size int64) {
+	c.ul_reqsize = min(size, maxRequestSize)
+}
+
 // Set connection timeout
 func (c *config) SetTimeOut(t time.Duration) {
 	c.timeout = t
 }
 
-// Set concurrent upload workers
+// Set concurrent upload workers used by UploadFile and Upload.UploadFrom
 func (c *config) SetUploadWorkers(w int) error {
 	if w <= MAX_UPLOAD_WORKERS {
 		c.ul_workers = w
@@ -1046,6 +1073,9 @@ func (m *Mega) getFileSystem() error {
 	return nil
 }
 
+// an all nil IV for mac calculations
+var zero_iv = make([]byte, 16)
+
 // Move a file from one location to another
 func (m *Mega) Move(src *Node, parent *Node) error {
 	m.FS.mutex.Lock()
@@ -1143,9 +1173,9 @@ func (m *Mega) CreateDir(name string, parent *Node) (*Node, error) {
 	var msg [1]UploadCompleteMsg
 	var res [1]UploadCompleteResp
 
-	compkey := []uint32{0, 0, 0, 0, 0, 0}
-	for i := range compkey {
-		compkey[i] = uint32(mrand.Int31())
+	compkey := make([]uint32, 6)
+	if err := binary.Read(rand.Reader, binary.BigEndian, compkey); err != nil {
+		return nil, err
 	}
 
 	master_aes, err := aes.NewCipher(m.k)

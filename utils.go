@@ -2,6 +2,7 @@ package mega
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -9,11 +10,13 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -297,6 +300,19 @@ func getChunkSizes(size int64) (chunks []chunkSize) {
 	return chunks
 }
 
+// groupChunks merges consecutive chunks into parts of at least size
+// bytes, so every part still ends on a chunk boundary
+func groupChunks(chunks []chunkSize, size int64) (parts []chunkSize) {
+	for _, c := range chunks {
+		if n := len(parts); n > 0 && int64(parts[n-1].size) < size {
+			parts[n-1].size += c.size
+		} else {
+			parts = append(parts, c)
+		}
+	}
+	return parts
+}
+
 var attrMatch = regexp.MustCompile(`{".*"}`)
 
 func decryptAttr(key []byte, data string) (attr FileAttr, err error) {
@@ -373,4 +389,129 @@ func halfCPUCores() int {
 		return 1
 	}
 	return n
+}
+
+// newCTR returns the AES-CTR stream used to encrypt and decrypt file
+// data starting at offset. Only the first 8 bytes of nonce are used.
+func newCTR(block cipher.Block, nonce []byte, offset int64) cipher.Stream {
+	iv := make([]byte, 16)
+	copy(iv, nonce[:8])
+	binary.BigEndian.PutUint64(iv[8:], uint64(offset)/16)
+	ctr := cipher.NewCTR(block, iv)
+	// the counter addresses 16 byte blocks so skip to offset within one
+	skip := make([]byte, offset%16)
+	ctr.XORKeyStream(skip, skip)
+	return ctr
+}
+
+// chunkMAC returns the CBC-MAC of the plaintext of one non-empty chunk
+func chunkMAC(block cipher.Block, iv, chunk []byte) []byte {
+	mac := make([]byte, 16)
+	buf := make([]byte, (len(chunk)+15)&^15) // zero padded
+	copy(buf, chunk)
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(buf, buf)
+	copy(mac, buf[len(buf)-16:])
+	return mac
+}
+
+// macWriter computes the MAC of each chunk of a file from its
+// plaintext, which is written to it in order starting at offset.
+//
+// The MAC of a chunk is passed to setMAC once its last byte has been
+// written. Chunks not written from their start are skipped.
+type macWriter struct {
+	block  cipher.Block
+	iv     []byte
+	chunks []chunkSize
+	setMAC func(id int, mac []byte)
+	pos    int64  // file position of the next byte
+	chunk  int    // index of the chunk containing pos
+	whole  bool   // set if the current chunk is being written from its start
+	buf    []byte // plaintext of the current chunk so far
+}
+
+func newMACWriter(block cipher.Block, iv []byte, chunks []chunkSize, offset int64, setMAC func(id int, mac []byte)) *macWriter {
+	chunk := sort.Search(len(chunks), func(i int) bool {
+		return chunks[i].position+int64(chunks[i].size) > offset
+	})
+	return &macWriter{
+		block:  block,
+		iv:     iv,
+		chunks: chunks,
+		setMAC: setMAC,
+		pos:    offset,
+		chunk:  chunk,
+		whole:  chunk < len(chunks) && chunks[chunk].position == offset,
+	}
+}
+
+// Write feeds plaintext b into the chunk MACs. It never returns an
+// error.
+func (w *macWriter) Write(b []byte) (int, error) {
+	n := len(b)
+	for len(b) > 0 && w.chunk < len(w.chunks) {
+		chunkEnd := w.chunks[w.chunk].position + int64(w.chunks[w.chunk].size)
+		k := int(min(int64(len(b)), chunkEnd-w.pos))
+		if w.whole {
+			w.buf = append(w.buf, b[:k]...)
+		}
+		w.pos += int64(k)
+		b = b[k:]
+		if w.pos == chunkEnd {
+			if w.whole {
+				w.setMAC(w.chunk, chunkMAC(w.block, w.iv, w.buf))
+			}
+			w.buf = w.buf[:0]
+			w.whole = true
+			w.chunk++
+		}
+	}
+	return n, nil
+}
+
+// progressWriter sends the size of each write to a progress channel
+type progressWriter chan int
+
+func (p progressWriter) Write(b []byte) (int, error) {
+	p <- len(b)
+	return len(b), nil
+}
+
+// withProgress returns r, reporting the size of each read to progress
+// if it is not nil
+func withProgress(r io.Reader, progress *chan int) io.Reader {
+	if progress == nil {
+		return r
+	}
+	return io.TeeReader(r, progressWriter(*progress))
+}
+
+// statusError returns the error for a transfer request which got a
+// status other than 200
+func statusError(resp *http.Response) error {
+	if resp.StatusCode == 509 {
+		// the transfer quota is exceeded
+		return EOVERQUOTA
+	}
+	return errors.New("Http Status: " + resp.Status)
+}
+
+// withRetries calls fn until it succeeds, the configured retries are
+// used up or ctx is done, backing off between attempts. EOVERQUOTA is
+// not retried as it lasts far longer than the backoff.
+func (m *Mega) withRetries(ctx context.Context, what string, fn func() error) (err error) {
+	sleepTime := minSleepTime // initial backoff time
+	for retry := 0; ; retry++ {
+		err = fn()
+		if err == nil || errors.Is(err, EOVERQUOTA) || retry >= m.retries || ctx.Err() != nil {
+			return err
+		}
+		m.debugf("%s: retry %d/%d: %v", what, retry+1, m.retries, err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sleepTime):
+		}
+		sleepTime = min(2*sleepTime, maxSleepTime)
+	}
 }
