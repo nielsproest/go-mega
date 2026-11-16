@@ -154,15 +154,16 @@ func (d *Download) setChunkMAC(id int, mac []byte) {
 	d.mutex.Unlock()
 }
 
-// fetchRange reads the encrypted bytes from start up to but not
-// including end, retrying as configured.
-func (d *Download) fetchRange(ctx context.Context, start, end int64) (data []byte, err error) {
-	what := fmt.Sprintf("%s: download %d-%d", d.src.name, start, end-1)
-	err = d.m.withRetries(ctx, what, func() error {
+// readAt reads len(buf) encrypted bytes at offset off into buf,
+// retrying as configured.
+func (d *Download) readAt(ctx context.Context, buf []byte, off int64) error {
+	end := off + int64(len(buf))
+	what := fmt.Sprintf("%s: download %d-%d", d.src.name, off, end-1)
+	return d.m.withRetries(ctx, what, func() error {
 		d.mutex.Lock()
 		base := d.resourceUrl
 		d.mutex.Unlock()
-		url := fmt.Sprintf("%s/%d-%d", base, start, end-1)
+		url := fmt.Sprintf("%s/%d-%d", base, off, end-1)
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
 			return err
@@ -181,14 +182,12 @@ func (d *Download) fetchRange(ctx context.Context, start, end int64) (data []byt
 		if resp.StatusCode != 200 {
 			return statusError(resp)
 		}
-		if resp.ContentLength >= 0 && resp.ContentLength != end-start {
+		if resp.ContentLength >= 0 && resp.ContentLength != int64(len(buf)) {
 			return fmt.Errorf("wrong size for downloaded range: %d bytes", resp.ContentLength)
 		}
-		data = make([]byte, end-start)
-		_, err = io.ReadFull(resp.Body, data)
+		_, err = io.ReadFull(resp.Body, buf)
 		return err
 	})
-	return data, err
 }
 
 // refreshURL replaces the download URL with a new one from the API,
@@ -276,7 +275,7 @@ func newParallelReader(ctx context.Context, d *Download, start, end int64, worke
 		for pos := start; pos < end || len(inflight) > 0; {
 			for pos < end && len(inflight) < limit {
 				next := min(pos+size, end)
-				inflight <- p.fetch(ctx, d, pos, next)
+				inflight <- p.startRead(ctx, d, pos, next)
 				pos = next
 				size = min(2*size, reqsize)
 			}
@@ -295,14 +294,15 @@ func newParallelReader(ctx context.Context, d *Download, start, end int64, worke
 	return p
 }
 
-// fetch fetches a range in the background, returning a channel which
-// receives the result
-func (p *parallelReader) fetch(ctx context.Context, d *Download, start, end int64) chan rangePart {
+// startRead starts reading a range with readAt in the background,
+// returning a channel which receives the result
+func (p *parallelReader) startRead(ctx context.Context, d *Download, start, end int64) chan rangePart {
 	result := make(chan rangePart, 1)
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		data, err := d.fetchRange(ctx, start, end)
+		data := make([]byte, end-start)
+		err := d.readAt(ctx, data, start)
 		result <- rangePart{data: data, err: err}
 	}()
 	return result

@@ -166,12 +166,12 @@ func (u *Upload) setChunkMAC(id int, mac []byte) {
 	u.mutex.Unlock()
 }
 
-// postRange uploads the encrypted data at offset, retrying as
+// writeAt uploads the encrypted data at offset off, retrying as
 // configured, and records the completion handle if the server returns
 // one.
-func (u *Upload) postRange(ctx context.Context, offset int64, data []byte) error {
-	url := fmt.Sprintf("%s/%d", u.uploadUrl, offset)
-	what := fmt.Sprintf("%s: upload %d+%d", u.name, offset, len(data))
+func (u *Upload) writeAt(ctx context.Context, data []byte, off int64) error {
+	url := fmt.Sprintf("%s/%d", u.uploadUrl, off)
+	what := fmt.Sprintf("%s: upload %d+%d", u.name, off, len(data))
 	return u.m.withRetries(ctx, what, func() error {
 		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
 		if err != nil {
@@ -239,7 +239,7 @@ func (u *Upload) UploadFrom(ctx context.Context, id, n int, in io.Reader) error 
 			return err
 		}
 		g.Go(func() error {
-			return u.postRange(gctx, part.position, data)
+			return u.writeAt(gctx, data, part.position)
 		})
 	}
 	return g.Wait()
