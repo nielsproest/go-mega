@@ -39,11 +39,10 @@ type Upload struct {
 	completion_handle []byte
 }
 
-// Create a new Upload of name into parent of fileSize
+// NewUpload creates a new Upload of name into parent of fileSize.
 //
-// Call Chunks to find out how many chunks there are, then for id =
-// 0..chunks-1 Call ChunkLocation then UploadChunk.  Finally call
-// Finish() to receive the error status and the *Node.
+// Upload the file contents with UploadFrom, then call Finish to
+// receive the error status and the *Node.
 func (m *Mega) NewUpload(parent *Node, name string, fileSize int64) (*Upload, error) {
 	if parent == nil {
 		return nil, EARGS
@@ -144,7 +143,11 @@ func (u *Upload) ChunkLocation(id int) (position int64, size int, err error) {
 	return u.chunks[id].position, u.chunks[id].size, nil
 }
 
-// UploadChunk uploads the chunk of id
+// UploadChunk encrypts and uploads chunk, which must be the contents
+// of the chunk with the given id, recording its MAC for Finish.
+//
+// Deprecated: use UploadFrom, which streams the data using parallel
+// requests and is considerably faster.
 func (u *Upload) UploadChunk(id int, chunk []byte) error {
 	_, chk_size, err := u.ChunkLocation(id)
 	if err != nil {

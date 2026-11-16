@@ -27,11 +27,10 @@ type Download struct {
 	chunk_macs  [][]byte
 }
 
-// Create a new Download from the src Node
+// NewDownload creates a new Download of the src Node.
 //
-// Call Chunks to find out how many chunks there are, then for id =
-// 0..chunks-1 call DownloadChunk.  Finally call Finish() to receive
-// the error status.
+// Read the file contents with NewReader, then call Finish to verify
+// the MAC once the whole file has been read.
 func (m *Mega) NewDownload(src *Node) (*Download, error) {
 	if src == nil {
 		return nil, EARGS
@@ -126,8 +125,11 @@ func (d *Download) ChunkLocation(id int) (position int64, size int, err error) {
 	return d.chunks[id].position, d.chunks[id].size, nil
 }
 
-// DownloadChunk gets a chunk with the given number and update the
-// mac, returning the position in the file of the chunk
+// DownloadChunk downloads and decrypts the chunk with the given id,
+// recording its MAC for Finish.
+//
+// Deprecated: use NewReader, which streams the data using parallel
+// requests and is considerably faster.
 func (d *Download) DownloadChunk(id int) (chunk []byte, err error) {
 	chk_start, chk_size, err := d.ChunkLocation(id)
 	if err != nil {
